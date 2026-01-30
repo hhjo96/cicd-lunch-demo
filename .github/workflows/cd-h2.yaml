@@ -17,11 +17,25 @@ concurrency:
 
 jobs:
   build-and-push:
-    name: Build & Push Docker Image
+    name: Build JAR & Push Docker Image (arm64 only)
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Build JAR (Gradle)
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon bootJar -x test
+          ls -al build/libs
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -35,12 +49,13 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build and push (arm64 only)
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: ./Dockerfile
           push: true
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/arm64
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/lunch-app:${{ github.sha }}
             ${{ secrets.DOCKERHUB_USERNAME }}/lunch-app:latest
@@ -52,6 +67,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-and-push
     if: ${{ github.event_name == 'push' || inputs.deploy }}
+
     steps:
       - name: Configure AWS credentials (Access Key)
         uses: aws-actions/configure-aws-credentials@v4
@@ -60,12 +76,13 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ap-northeast-2
 
-      - name: Deploy via SSM
+      - name: Deploy via SSM (deploy by SHA tag)
         env:
           REGION: ap-northeast-2
           INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
           set -euo pipefail
 
@@ -75,10 +92,10 @@ jobs:
               "set -euo pipefail",
               "docker version",
               "echo \"$DOCKERHUB_TOKEN\" | docker login -u \"$DOCKERHUB_USERNAME\" --password-stdin",
-              "docker pull \"$DOCKERHUB_USERNAME/lunch-app:latest\"",
+              "docker pull \"$DOCKERHUB_USERNAME/lunch-app:$IMAGE_TAG\"",
               "docker stop lunch-app || true",
               "docker rm lunch-app || true",
-              "docker run -d --name lunch-app -p 8080:8080 -e \"SPRING_DATASOURCE_URL=jdbc:h2:mem:lunch;MODE=MySQL\" -e \"SPRING_DATASOURCE_DRIVER_CLASS_NAME=org.h2.Driver\" -e \"SPRING_JPA_DATABASE_PLATFORM=org.hibernate.dialect.H2Dialect\" -e \"SPRING_JPA_HIBERNATE_DDL_AUTO=create\" -e \"SPRING_FLYWAY_ENABLED=false\" --restart always \"$DOCKERHUB_USERNAME/lunch-app:latest\"",
+              "docker run -d --name lunch-app -p 8080:8080 -e \"SPRING_DATASOURCE_URL=jdbc:h2:mem:lunch;MODE=MySQL\" -e \"SPRING_DATASOURCE_DRIVER_CLASS_NAME=org.h2.Driver\" -e \"SPRING_JPA_DATABASE_PLATFORM=org.hibernate.dialect.H2Dialect\" -e \"SPRING_JPA_HIBERNATE_DDL_AUTO=create\" -e \"SPRING_FLYWAY_ENABLED=false\" --restart always \"$DOCKERHUB_USERNAME/lunch-app:$IMAGE_TAG\"",
               "docker ps | grep lunch-app",
               "docker logs --tail 50 lunch-app || true"
             ]
@@ -90,7 +107,7 @@ jobs:
               --region "$REGION" \
               --instance-ids "$INSTANCE_ID" \
               --document-name "AWS-RunShellScript" \
-              --comment "Deploy lunch-app" \
+              --comment "Deploy lunch-app ($IMAGE_TAG)" \
               --parameters file://ssm-params.json \
               --query "Command.CommandId" \
               --output text
